@@ -55,6 +55,10 @@ jobs:
           git fetch --depth 1 origin "$BASE"
           git checkout -q FETCH_HEAD
           git log -1 --format='Telegram base commit: %H'
+          # Telegram keeps its libraries and the media module in git submodules (official step from its README)
+          git submodule update --init --recursive --depth=1 --jobs 4 || git submodule update --init --recursive
+          git submodule status | head -30
+          du -sh . || true
 
       - name: Apply the mod
         run: |
