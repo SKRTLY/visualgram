@@ -1,0 +1,292 @@
+name: Build SKgram APK
+
+# Запускається вручну: вкладка Actions -> Build SKgram APK -> Run workflow
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+
+    steps:
+      - name: Checkout mod files
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          df -h /
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android SDK parts
+        run: |
+          # The GitHub runner already has an Android SDK. If its sdkmanager is missing, download one.
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          SDKM="$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -V | tail -n 1 || true)"
+          if [ -z "$SDKM" ]; then
+            echo "No preinstalled sdkmanager, downloading command line tools"
+            export ANDROID_HOME="$HOME/android-sdk"
+            mkdir -p "$ANDROID_HOME/cmdline-tools"
+            curl -fsSL -o "$RUNNER_TEMP/cmdline-tools.zip" https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            unzip -q "$RUNNER_TEMP/cmdline-tools.zip" -d "$ANDROID_HOME/cmdline-tools"
+            mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+            SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          fi
+          echo "sdkmanager: $SDKM"
+          echo "SDK folder: $ANDROID_HOME"
+          yes | "$SDKM" --sdk_root="$ANDROID_HOME" --licenses > /dev/null || true
+          "$SDKM" --sdk_root="$ANDROID_HOME" "platforms;android-36" "build-tools;36.0.0" "ndk;27.2.12479018" "cmake;3.22.1"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+
+      - name: Download Telegram source (pinned commit)
+        run: |
+          BASE=$(cat BASE_COMMIT)
+          mkdir telegram
+          cd telegram
+          git init -q
+          git remote add origin https://github.com/DrKLO/Telegram.git
+          git fetch --depth 1 origin "$BASE"
+          git checkout -q FETCH_HEAD
+          git log -1 --format='Telegram base commit: %H'
+          # Telegram keeps its libraries and the media module in git submodules (official step from its README)
+          git submodule update --init --recursive --depth=1 --jobs 4 || git submodule update --init --recursive
+          git submodule status | head -30
+          du -sh . || true
+
+      - name: Apply the mod
+        run: |
+          # the phone may rename the downloaded file (telegram-mod(43).patch): take telegram-mod.patch, else the only telegram-mod*.patch
+          if [ -f telegram-mod.patch ]; then
+            PATCH=telegram-mod.patch
+          else
+            shopt -s nullglob
+            FOUND=(telegram-mod*.patch)
+            if [ "${#FOUND[@]}" -eq 1 ]; then
+              PATCH="${FOUND[0]}"
+              echo "::warning::Патч називається $PATCH, краще перейменуйте його в telegram-mod.patch"
+            else
+              echo "::error::Потрібен рівно один файл telegram-mod.patch у корені репозиторію (знайдено: ${#FOUND[@]})"
+              exit 1
+            fi
+          fi
+          echo "Patch: $PATCH"
+          cd telegram
+          git apply --whitespace=nowarn "../$PATCH"
+          echo "Changed files: $(git status --short | wc -l)"
+
+      - name: Firebase config (for push notifications)
+        env:
+          GS: ${{ secrets.GOOGLE_SERVICES_JSON_BASE64 }}
+        run: |
+          OUT=telegram/TMessagesProj_App/google-services.json
+          if [ -n "$GS" ]; then
+            echo "$GS" | base64 -d > "$OUT"
+            echo "Using your Firebase config"
+          else
+            cp dummy-google-services.json "$OUT"
+            echo "::notice::Firebase не підключено: застосунок збереться, але пуш-сповіщення від Google не працюватимуть."
+          fi
+
+      - name: Signing key
+        env:
+          KS: ${{ secrets.KEYSTORE_BASE64 }}
+          KSPASS: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: |
+          KSFILE=telegram/TMessagesProj/config/release.keystore
+          rm -f "$KSFILE"
+          if [ -n "$KS" ]; then
+            echo "$KS" | base64 -d > "$KSFILE"
+            echo "Using your signing key"
+          else
+            echo "::warning::Секрет KEYSTORE_BASE64 не задано: створено тимчасовий ключ. Такий APK не оновиться поверх попередньої збірки, треба буде видалити старий."
+            keytool -genkeypair -keystore "$KSFILE" -storepass "${KSPASS:-android}" -keypass "${KSPASS:-android}" \
+              -alias androidkey -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=SKgram"
+          fi
+
+      # Your API id and API hash are NOT written into the code as plain text. They are encrypted with a
+      # key made from the certificate that signs the APK (see ModKeys.java in the patch).
+      - name: Hide your Telegram API keys (encrypt them for this signing key)
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          KSPASS: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: |
+          if ! [[ "$TG_API_ID" =~ ^[0-9]{1,10}$ ]] || ! [[ "$TG_API_HASH" =~ ^[0-9a-fA-F]{32}$ ]]; then
+            echo "::error::Додайте секрети TG_API_ID (число) і TG_API_HASH (32 символи) з my.telegram.org. Дивіться README."
+            exit 1
+          fi
+          KSFILE=telegram/TMessagesProj/config/release.keystore
+          PASS="${KSPASS:-android}"
+          CERTFILE="${RUNNER_TEMP:-/tmp}/sk_cert.der"
+          rm -f "$CERTFILE"
+          keytool -exportcert -alias androidkey -keystore "$KSFILE" -storepass "$PASS" -file "$CERTFILE" > /dev/null 2>&1 || true
+          if [ ! -s "$CERTFILE" ]; then
+            echo "::error::Не вдалося прочитати сертифікат з ключа підпису (alias androidkey). Перевірте секрети KEYSTORE_BASE64 і KEYSTORE_PASSWORD."
+            exit 1
+          fi
+          export CERT_SHA256="$(sha256sum "$CERTFILE" | cut -d' ' -f1)"
+          python3 - <<'PY'
+          import os, hashlib, secrets
+          api_id = os.environ["TG_API_ID"]
+          api_hash = os.environ["TG_API_HASH"]
+          cert = bytes.fromhex(os.environ["CERT_SHA256"])
+          salt = secrets.token_bytes(16)
+          plain = (api_id + ":" + api_hash).encode()
+          out = bytearray()
+          for block in range((len(plain) + 31) // 32):
+              stream = hashlib.sha256(cert + salt + bytes([(block >> 8) & 255, block & 255])).digest()
+              chunk = plain[block * 32:(block + 1) * 32]
+              out += bytes(a ^ b for a, b in zip(chunk, stream))
+          path = "telegram/TMessagesProj/src/main/java/org/telegram/messenger/mod/ModKeys.java"
+          src = open(path, encoding="utf-8").read()
+          if "@@SK_PAYLOAD@@" not in src or "@@SK_SALT@@" not in src:
+              raise SystemExit("::error::У ModKeys.java немає місця для зашифрованих ключів. Завантажте свіжий telegram-mod.patch.")
+          src = src.replace("@@SK_PAYLOAD@@", out.hex()).replace("@@SK_SALT@@", salt.hex())
+          open(path, "w", encoding="utf-8").write(src)
+          PY
+          if grep -q "@@SK_" telegram/TMessagesProj/src/main/java/org/telegram/messenger/mod/ModKeys.java; then
+            echo "::error::Не вдалося зашифрувати API ключі"
+            exit 1
+          fi
+          echo "CERT_SHA256=$CERT_SHA256" >> "${GITHUB_ENV:-/dev/null}"
+          echo "API keys are encrypted for this signing certificate"
+
+      # Only the owner of the build can give badges. His numeric Telegram ID is a build secret (OWNER_TG_ID).
+      - name: Set the owner of the badges
+        env:
+          OWNER_TG_ID: ${{ secrets.OWNER_TG_ID }}
+        run: |
+          FILE=telegram/TMessagesProj/src/main/java/org/telegram/messenger/mod/ModOwner.java
+          if [[ "$OWNER_TG_ID" =~ ^[0-9]{5,15}(,[0-9]{5,15})*$ ]]; then
+            sed -i "s/@@SK_OWNER@@/$OWNER_TG_ID/" "$FILE"
+            echo "The owner of the badges is set"
+          else
+            sed -i "s/@@SK_OWNER@@/-/" "$FILE"
+            echo "::warning::Секрет OWNER_TG_ID не задано або він неправильний: у цій збірці ніхто не зможе видавати галочки. Додайте свій числовий Telegram ID, дивіться README."
+          fi
+          if grep -q "@@SK_" "$FILE"; then
+            echo "::error::Не вдалося записати власника галочок"
+            exit 1
+          fi
+
+      - name: Put the starting list of badges into the app
+        env:
+          CHANNEL_SECRET: ${{ secrets.BADGES_CHANNEL }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+
+          FILE = "telegram/TMessagesProj/src/main/java/org/telegram/messenger/mod/ModRegistry.java"
+          LINE = re.compile(r"^(\d{4,15})[\s:;,]+(\d{1,2})(?:[\s:;,]+(.*))?$")
+
+          def java_string(text):
+              out = []
+              for ch in text:
+                  code = ord(ch)
+                  if ch == "\\":
+                      out.append("\\\\")
+                  elif ch == '"':
+                      out.append('\\"')
+                  elif ch == "\n":
+                      out.append("\\n")
+                  elif code < 32 or code > 126:
+                      data = ch.encode("utf-16-be")
+                      for i in range(0, len(data), 2):
+                          out.append("\\u%02x%02x" % (data[i], data[i + 1]))
+                  else:
+                      out.append(ch)
+              return "".join(out)
+
+          lines = []
+          if os.path.exists("badges.txt"):
+              with open("badges.txt", encoding="utf-8-sig") as f:
+                  for number, raw in enumerate(f.read().splitlines(), 1):
+                      line = raw.strip()
+                      if not line or line.startswith("#"):
+                          continue
+                      m = LINE.match(line)
+                      if not m or not 1 <= int(m.group(2)) <= 36:
+                          print("::warning::badges.txt, рядок %d пропущено (потрібно: ID малюнок текст, малюнок від 1 до 36): %s" % (number, line[:40]))
+                          continue
+                      lines.append(line)
+          else:
+              print("::notice::Файлу badges.txt немає: у збірці не буде спільного списку галочок.")
+
+          src = open(FILE, encoding="utf-8").read()
+          # the own channel of the owner: t.me/name, https://t.me/name, @name or just name
+          channel = os.environ.get("CHANNEL_SECRET", "").strip()
+          channel = re.sub(r"^(https?://)?(www\.)?t(elegram)?\.me/", "", channel).lstrip("@").split("/")[0].split("?")[0]
+          if channel and not re.match(r"^[A-Za-z][A-Za-z0-9_]{4,31}$", channel):
+              print("::warning::Секрет BADGES_CHANNEL не схожий на публічну назву каналу (5-32 символи: латиниця, цифри, _), тому його проігноровано: застосунок створить власний канал.")
+              channel = ""
+          src = src.replace("@@SK_BADGES@@", java_string("\n".join(lines)))
+          src = src.replace("@@SK_CHANNEL@@", channel)
+          if "@@SK_" in src:
+              raise SystemExit("::error::Не вдалося записати список галочок")
+          open(FILE, "w", encoding="utf-8").write(src)
+          print("Badges baked into the build: %d, own channel: %s" % (len(lines), channel or "-"))
+          PY
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('BASE_COMMIT') }}-${{ github.run_id }}
+          restore-keys: |
+            gradle-${{ hashFiles('BASE_COMMIT') }}-
+            gradle-
+
+      - name: Build APK
+        working-directory: telegram
+        env:
+          KSPASS: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: |
+          chmod +x gradlew
+          PASS="${KSPASS:-android}"
+          ./gradlew :TMessagesProj_App:assembleAfatRelease --stacktrace --no-daemon --build-cache \
+            -PRELEASE_STORE_PASSWORD="$PASS" -PRELEASE_KEY_PASSWORD="$PASS" -PRELEASE_KEY_ALIAS=androidkey
+
+      - name: Check that the API keys are hidden in the APK
+        env:
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+        run: |
+          APK=telegram/TMessagesProj_App/build/outputs/apk/afat/release/app.apk
+          WORK="${RUNNER_TEMP:-/tmp}/sk_apkcheck"
+          rm -rf "$WORK"
+          mkdir -p "$WORK"
+          unzip -q -o "$APK" 'classes*.dex' -d "$WORK"
+          if grep -rqaiF -- "$TG_API_HASH" "$WORK"; then
+            echo "::error::API hash знайдено у відкритому вигляді всередині APK. Такий APK не можна роздавати."
+            exit 1
+          fi
+          echo "OK: API hash у відкритому вигляді в APK відсутній"
+          APKSIGNER="$(ls "$ANDROID_HOME"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -n 1 || true)"
+          if [ -z "$APKSIGNER" ]; then
+            echo "::warning::apksigner не знайдено, збіг сертифіката не перевірено"
+          else
+            APK_CERT="$("$APKSIGNER" verify --print-certs "$APK" 2>/dev/null | grep -m1 'certificate SHA-256 digest' | awk '{print $NF}' | tr 'A-F' 'a-f' || true)"
+            if [ -z "$APK_CERT" ]; then
+              echo "::warning::Не вдалося прочитати сертифікат APK, збіг не перевірено"
+            elif [ "$APK_CERT" != "$CERT_SHA256" ]; then
+              echo "::error::Сертифікат підпису APK не збігається з тим, для якого зашифровано ключі. У такому APK не працював би вхід. Повідомте про це."
+              exit 1
+            else
+              echo "OK: сертифікат підпису збігається, ключі розшифруються на телефоні"
+            fi
+          fi
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SKgram-apk
+          path: telegram/TMessagesProj_App/build/outputs/apk/afat/release/app.apk
+          if-no-files-found: error
